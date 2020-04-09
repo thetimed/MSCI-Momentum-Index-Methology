@@ -1,0 +1,190 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+from quantopian.pipeline.data import morningstar
+from quantopian.pipeline import CustomFactor
+import pandas as pd
+import quantopian.optimize as opt
+import quantopian.algorithm as algo
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.sentdex import sentiment 
+from quantopian.pipeline.factors import AverageDollarVolume, SimpleMovingAverage, Returns
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.psychsignal import (
+    aggregated_twitter_withretweets_stocktwits, #Psychsignal data from Twitter and Stocktwits.
+    stocktwits,                                 #Psychsignal data from Stocktwits.
+    twitter_noretweets,                         #Psychsignal data from Twitter (no retweets).
+    twitter_withretweets,                       #Psychsignal data from Twitter (with retweets).
+)
+import quantopian.optimize as opt
+import numpy as np  
+import math
+
+MAX_GROSS_LEVERAGE = 1.0
+MAX_LONG_POSITION_SIZE = 0.05   # 1.5%
+
+constrain_gross_leverage = opt.MaxGrossExposure(MAX_GROSS_LEVERAGE)
+
+constrain_pos_size = opt.PositionConcentration.with_equal_bounds(  
+    0,  
+    MAX_LONG_POSITION_SIZE,  
+)
+
+class momentum_factor_1(CustomFactor):
+        inputs = [USEquityPricing.close]
+        window_length = 126
+ 
+        def compute(self, today, assets, out, close):
+           out[:] = close[-1]/close[0]
+
+
+class momentum_factor_2(CustomFactor):    
+        inputs = [USEquityPricing.close]   
+        window_length = 252  
+     
+        def compute(self, today, assets, out, close):      
+                out[:] = close[-1]/close[0] 
+               
+
+            
+class ComputeVolSignal(CustomFactor):  
+        inputs = [Returns(window_length=2)]  
+        window_length = 750
+
+        def compute(self, today, assets, out, returns):  
+            out[:] = returns.std(axis=0) * np.sqrt(250)
+
+ 
+
+
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """
+    # Rebalance every month to reduce turnoever, 1 hour after market open.
+    algo.schedule_function(
+        rebalance,
+        algo.date_rules.month_start(),
+        algo.time_rules.market_open(hours=1),
+    )
+
+    # Record tracking variables at the end of each day.
+    algo.schedule_function(
+        record_vars,
+        algo.date_rules.every_day(),
+        algo.time_rules.market_close(),
+    )
+
+    # Create our dynamic stock selector.
+    algo.attach_pipeline(pipeline(), 'pipeline')
+
+def pipeline():
+        Dollar_volume = AverageDollarVolume(window_length=28)
+        Decent_dollar_volume = Dollar_volume.percentile_between(50, 100)
+        revenue_growth = Fundamentals.revenue_growth.latest 
+        mean_sentiment_30day = SimpleMovingAverage(inputs=[sentiment.sentiment_signal],window_length=30)
+        universe = (QTradableStocksUS() & Decent_dollar_volume)    
+        Bullish_stocktwits_twitter = (aggregated_twitter_withretweets_stocktwits.bullish_intensity.latest > 1)
+        Market_cap= morningstar.valuation.market_cap.latest  
+        vol = ComputeVolSignal()
+        v = momentum_factor_1()
+        x = momentum_factor_2()
+        v_result = v.rank(mask = universe, ascending = False)/vol        
+        x_result = x.rank(mask = universe, ascending = False)/vol
+        x_adj = x_result
+        v_adj = v_result
+        x = x_adj.zscore()
+        v = v_adj.zscore()
+        z_score_finalised = x * 0.5 + v * 0.5
+        market_cap= morningstar.valuation.market_cap.latest  
+
+        
+        function_Momentum_z_score = (lambda x: (x+1) if x > 0 else (1-x)**-1) #bug remained to be fixed
+        
+        Momentum_z_score = function_Momentum_z_score(z_score_finalised)
+        
+        Momentum_Weight = (Momentum_z_score)/market_cap
+        Top_Momentum_weight = Momentum_Weight.top(300)
+        
+        
+        pipe = Pipeline(columns={'z score': z_score_finalised,
+                                'Momentum_z_score' : Momentum_z_score,
+                                'Momentum_weight' :Momentum_Weight,
+                                'longs': Top_Momentum_weight,
+                                },
+        screen = (universe))
+
+        return pipe
+
+#1326 mean
+
+def before_trading_start(context, data):
+    """
+    Called every day before market open.
+    """
+    context.output = algo.pipeline_output('pipeline')
+    
+    context.security_list = context.output
+
+    
+    
+def rebalance(context, data):
+    """
+    Execute orders according to our schedule_function() timing.
+    """
+    todays_universe = context.output.index
+    context.weights = {}
+    long_secs = context.output[context.output['longs']].index
+    market_weight = context.output.loc[context.output['longs'] == True]
+    calibration_purposes = market_weight.drop(['longs'], axis = 1)
+    total_weight = calibration_purposes.sum()
+    market_weight_index = calibration_purposes.div(total_weight)
+    i = 0
+
+    for sec in long_secs:
+        if data.can_trade(sec):
+            context.weights[sec] = market_weight_index.iloc[i][0]
+            i += 1
+            
+    objective = opt.TargetWeights(context.weights)
+   
+    algo.order_optimal_portfolio(
+        objective=objective,
+        constraints=[constrain_gross_leverage,constrain_pos_size],
+        universe=todays_universe,
+    )
+
+
+def record_vars(context, data):
+    long_count = 0
+    short_count = 0
+    for position in context.portfolio.positions.values():
+        if position.amount > 0:
+            long_count += 1
+
+    # Plot the counts
+    record(num_long=long_count, num_short=short_count, leverage=context.account.leverage)
+
+
+def record_positions(context, data):
+    pos = pd.Series()
+    for position in context.portfolio.positions.values():
+        pos.loc[position.sid] = position.amount
+        
+    pos /= pos.abs().sum()
+    record(max_conc_perc=np.max(np.abs(pos)) * 100)
+    record(pos_count_div_100=len(pos) / 100)
+    
+    
+    
+    
+    
+def handle_data(context, data):
+    """
+    Called every minute.
+    """
+    pass
